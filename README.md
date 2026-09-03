@@ -29,6 +29,8 @@ docker compose up -d portfolio
 ```
 
 数据库保存在项目目录的 `data/portfolio.db`，不会进入镜像或 GitHub。
+首次打开网页会进入设置页，请创建登录账号和至少 8 位密码。登录账号和密码只以
+加盐哈希保存在该数据库中，不会写入 YAML、镜像或 GitHub。
 
 ## 手动备份
 

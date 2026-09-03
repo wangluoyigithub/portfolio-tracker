@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import json
+import hashlib
+import hmac
 import os
+import secrets
 import sqlite3
+import time
 import uuid
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +16,9 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get('PORTFOLIO_DB', ROOT / 'data' / 'portfolio.db'))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+SESSION_TTL = 60 * 60 * 24 * 14
+PASSWORD_ITERATIONS = 600_000
+SESSIONS = {}
 
 DEFAULT_SETTINGS = {
     'stock_buy_rate': 0.0003, 'stock_buy_min': 5.0,
@@ -59,6 +66,10 @@ def db():
         id TEXT PRIMARY KEY, sale_tx_id TEXT NOT NULL, buy_tx_id TEXT NOT NULL,
         account TEXT NOT NULL, code TEXT NOT NULL, buy_date TEXT NOT NULL,
         quantity REAL NOT NULL, holding_days INTEGER NOT NULL, rate REAL NOT NULL, fee REAL NOT NULL)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS auth_users (
+        username TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
+        salt TEXT NOT NULL, iterations INTEGER NOT NULL,
+        created_at TEXT NOT NULL)''')
     for key, value in DEFAULT_SETTINGS.items():
         conn.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
     template = [{'min_days': 0, 'max_days': 7, 'rate': 0.015}, {'min_days': 7, 'max_days': 30, 'rate': 0.0075}, {'min_days': 30, 'max_days': 180, 'rate': 0.005}, {'min_days': 180, 'max_days': 360, 'rate': 0}, {'min_days': 360, 'max_days': None, 'rate': 0}]
@@ -92,6 +103,49 @@ def db():
                 conn.execute(f'UPDATE {table} SET redemption_tiers=?, updated_at=? WHERE {where}', (json.dumps(tiers, ensure_ascii=False), date.today().isoformat(), *params))
     conn.commit()
     return conn
+
+
+def auth_user(conn):
+    return conn.execute('SELECT username, password_hash, salt, iterations FROM auth_users LIMIT 1').fetchone()
+
+
+def password_digest(password, salt, iterations=PASSWORD_ITERATIONS):
+    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, iterations).hex()
+
+
+def save_auth_user(conn, username, password):
+    salt = secrets.token_bytes(16)
+    digest = password_digest(password, salt)
+    conn.execute('DELETE FROM auth_users')
+    conn.execute('INSERT INTO auth_users VALUES (?,?,?,?,?)', (username, digest, salt.hex(), PASSWORD_ITERATIONS, datetime.now().isoformat(timespec='seconds')))
+    conn.commit()
+
+
+def verify_password(row, password):
+    try:
+        digest = password_digest(password, bytes.fromhex(row['salt']), int(row['iterations']))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(digest, row['password_hash'])
+
+
+def cleanup_sessions():
+    now = time.time()
+    for token, expires in list(SESSIONS.items()):
+        if expires <= now:
+            SESSIONS.pop(token, None)
+
+
+def auth_page(setup=False):
+    title = '首次设置账户' if setup else '登录'
+    hint = '第一次使用，请设置登录账号和密码。' if setup else '请输入登录账号和密码。'
+    endpoint = '/api/setup' if setup else '/api/login'
+    fields = '<label>账号<input name="username" autocomplete="username" required maxlength="64"></label><label>密码<input name="password" type="password" autocomplete="new-password" required minlength="8"></label>'
+    if setup:
+        fields += '<label>确认密码<input name="confirm" type="password" autocomplete="new-password" required minlength="8"></label>'
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · 基金股票账户管理</title><style>
+      :root{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#f4f7fb}}body{{margin:0;min-height:100vh;display:grid;place-items:center}}.card{{width:min(390px,calc(100vw - 40px));box-sizing:border-box;background:#fff;border:1px solid #dbe3ef;border-radius:18px;padding:30px;box-shadow:0 16px 40px #23395d18}}h1{{margin:0 0 8px;font-size:24px}}p{{color:#6d7b91;margin:0 0 24px}}label{{display:block;font-size:14px;color:#56657b;margin:14px 0 0}}input{{width:100%;box-sizing:border-box;margin-top:7px;border:1px solid #ccd7e6;border-radius:9px;padding:12px;font-size:16px}}button{{width:100%;margin-top:22px;border:0;border-radius:9px;padding:12px;background:#246bfe;color:#fff;font-size:16px;cursor:pointer}}.error{{min-height:20px;margin-top:14px;color:#d14343;font-size:14px}}</style></head><body><form class="card" id="authForm"><h1>{title}</h1><p>{hint}</p>{fields}<button type="submit">{'完成设置' if setup else '登录'}</button><div class="error" id="error"></div></form><script>
+      const form=document.getElementById('authForm');form.addEventListener('submit',async e=>{{e.preventDefault();const data=Object.fromEntries(new FormData(form));const error=document.getElementById('error');if(data.password!==data.confirm&&{str(setup).lower()}){{error.textContent='两次输入的密码不一致';return}};try{{const r=await fetch('{endpoint}',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data)}});const body=await r.json().catch(()=>({{}}));if(!r.ok)throw Error(body.error||'操作失败');location.href='/';}}catch(err){{error.textContent=err.message;}}}});</script></body></html>'''.encode('utf-8')
 
 
 def number(value):
@@ -373,21 +427,6 @@ def lookup_code(code):
     return {'code': code, 'candidates': candidates}
 
 
-def demo_transactions():
-    return [
-        {'id': str(uuid.uuid4()), 'date': '2026-01-10', 'account': '基金账户1', 'asset_type': '基金', 'code': '000300', 'name': '沪深300示例基金', 'action': '买入', 'quantity': 1000, 'price': 1.0, 'buy_fee': 5, 'sell_fee': 0, 'tax': 0, 'other_fee': 0, 'note': '示例数据，可删除'},
-        {'id': str(uuid.uuid4()), 'date': '2026-02-10', 'account': '基金账户1', 'asset_type': '基金', 'code': '000300', 'name': '沪深300示例基金', 'action': '买入', 'quantity': 500, 'price': 1.05, 'buy_fee': 2.6, 'sell_fee': 0, 'tax': 0, 'other_fee': 0, 'note': '示例数据，可删除'},
-        {'id': str(uuid.uuid4()), 'date': '2026-03-05', 'account': '基金账户1', 'asset_type': '基金', 'code': '000300', 'name': '沪深300示例基金', 'action': '现金分红', 'quantity': 0, 'price': 12, 'buy_fee': 0, 'sell_fee': 0, 'tax': 0, 'other_fee': 0, 'note': '示例数据，可删除'},
-        {'id': str(uuid.uuid4()), 'date': '2026-03-18', 'account': '股票账户1', 'asset_type': '股票', 'code': '600519', 'name': '贵州茅台示例', 'action': '买入', 'quantity': 100, 'price': 1500, 'buy_fee': 5, 'sell_fee': 0, 'tax': 0, 'other_fee': 0, 'note': '示例数据，可删除'},
-        {'id': str(uuid.uuid4()), 'date': '2026-04-10', 'account': '股票账户1', 'asset_type': '股票', 'code': '600519', 'name': '贵州茅台示例', 'action': '卖出', 'quantity': 20, 'price': 1600, 'buy_fee': 0, 'sell_fee': 5, 'tax': 32, 'other_fee': 0, 'note': '示例数据，可删除'},
-    ]
-
-
-def demo_prices():
-    stamp = date.today().isoformat()
-    return [{'code': '000300', 'name': '沪深300示例基金', 'asset_type': '基金', 'price': 1.12, 'updated_at': stamp}, {'code': '600519', 'name': '贵州茅台示例', 'asset_type': '股票', 'price': 1580, 'updated_at': stamp}]
-
-
 def replace_state(conn, transactions, prices, settings=None, fund_rules=None, templates=None, allocations=None):
     conn.execute('DELETE FROM transactions'); conn.execute('DELETE FROM prices'); conn.execute('DELETE FROM fund_rules'); conn.execute('DELETE FROM fund_rules_v2'); conn.execute('DELETE FROM fund_sale_allocations')
     for tx in transactions:
@@ -418,12 +457,43 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode('utf-8')
         self.send_response(status); self.send_header('Content-Type', 'application/json; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
 
+    def cookie_token(self):
+        raw = self.headers.get('Cookie', '')
+        for item in raw.split(';'):
+            key, _, value = item.strip().partition('=')
+            if key == 'portfolio_session': return value
+        return ''
+
+    def authenticated(self):
+        cleanup_sessions()
+        token = self.cookie_token()
+        return bool(token and token in SESSIONS and SESSIONS[token] > time.time())
+
+    def require_auth(self):
+        if self.authenticated(): return True
+        self.send_json({'error': '请先登录'}, 401)
+        return False
+
+    def set_session_cookie(self, token, max_age=SESSION_TTL):
+        self.send_header('Set-Cookie', f'portfolio_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}')
+
     def read_json(self):
         length = int(self.headers.get('Content-Length', '0'))
         return json.loads((self.rfile.read(length) if length else b'{}').decode('utf-8'))
 
     def do_GET(self):
         parsed, path = urlparse(self.path), urlparse(self.path).path
+        if path == '/api/auth':
+            conn = db(); configured = auth_user(conn) is not None; conn.close()
+            self.send_json({'configured': configured, 'authenticated': self.authenticated()}); return
+        if path in ('/', '/index.html'):
+            conn = db(); configured = auth_user(conn) is not None; conn.close()
+            if not configured:
+                body = auth_page(True); self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
+            if not self.authenticated():
+                body = auth_page(False); self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if path.startswith('/api/') and path not in ('/api/auth',):
+            if not self.require_auth(): return
         if path == '/api/state':
             conn = db(); tx, prices = all_transactions(conn), all_prices(conn); settings, rules = get_settings(conn), all_fund_rules(conn); templates, allocations = all_rule_templates(conn), all_sale_allocations(conn); conn.close()
             try:
@@ -449,8 +519,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path not in ('/api/setup', '/api/login', '/api/logout') and not self.require_auth(): return
         try:
             payload, conn = self.read_json(), db()
+            if path == '/api/setup':
+                if auth_user(conn) is not None: conn.close(); self.send_json({'error': '登录账号已经设置'}, 400); return
+                username = str(payload.get('username', '')).strip(); password = str(payload.get('password', ''))
+                if not username: raise ValueError('登录账号不能为空')
+                if len(password) < 8: raise ValueError('密码至少需要 8 位')
+                save_auth_user(conn, username, password); token = secrets.token_urlsafe(32); SESSIONS[token] = time.time() + SESSION_TTL; conn.close()
+                self.send_response(200); self.set_session_cookie(token); body = b'{"ok":true}'; self.send_header('Content-Type', 'application/json; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
+            if path == '/api/login':
+                row = auth_user(conn); username = str(payload.get('username', '')).strip(); password = str(payload.get('password', ''))
+                if row is None or username != row['username'] or not verify_password(row, password): conn.close(); self.send_json({'error': '账号或密码错误'}, 401); return
+                token = secrets.token_urlsafe(32); SESSIONS[token] = time.time() + SESSION_TTL; conn.close()
+                self.send_response(200); self.set_session_cookie(token); body = b'{"ok":true}'; self.send_header('Content-Type', 'application/json; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
+            if path == '/api/logout':
+                token = self.cookie_token(); SESSIONS.pop(token, None); conn.close(); self.send_response(200); self.set_session_cookie('', 0); body = b'{"ok":true}'; self.send_header('Content-Type', 'application/json; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
             if path == '/api/transactions':
                 candidate = {**payload, 'id': payload.get('id') or str(uuid.uuid4()), 'asset_type': payload.get('asset_type', '基金'), 'action': payload.get('action', '买入'), 'code': str(payload.get('code', '')).strip()}
                 candidate['account'] = str(candidate.get('account', '')).strip() or '默认账户'
@@ -498,14 +583,13 @@ class Handler(BaseHTTPRequestHandler):
                 q, p = number(payload.get('quantity')), number(payload.get('price')); cash_flow = -(q * p + number(payload.get('buy_fee')) + number(payload.get('other_fee'))) if action == '买入' else q * p - number(payload.get('sell_fee')) - number(payload.get('tax')) - number(payload.get('other_fee'))
                 preview = fee_preview(conn, tx, {**payload, 'operation': operation, 'date': sim_date}) if operation == '减仓' else {}
                 self.send_json({'before': now, 'after': later, 'cash_flow': cash_flow, 'lot_preview': preview.get('lot_preview', [])}); conn.close(); return
-            if path == '/api/reset-demo':
-                replace_state(conn, demo_transactions(), demo_prices()); conn.close(); self.send_json({'ok': True}); return
             if path == '/api/import':
                 replace_state(conn, payload.get('transactions', []), payload.get('prices', []), payload.get('settings'), payload.get('fund_rules'), payload.get('fund_rule_templates'), payload.get('sale_allocations')); conn.close(); self.send_json({'ok': True}); return
             conn.close(); self.send_json({'error': '未找到接口'}, 404)
         except (ValueError, KeyError, json.JSONDecodeError) as exc: self.send_json({'error': str(exc)}, 400)
 
     def do_DELETE(self):
+        if not self.require_auth(): return
         path = urlparse(self.path).path
         if path.startswith('/api/transactions/'):
             tx_id = path.rsplit('/', 1)[-1]

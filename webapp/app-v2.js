@@ -19,6 +19,7 @@ const findRule = (account, code) => state.fund_rules.find(rule => rule.account =
 async function api(url, options = {}) {
   const response = await fetch(url, { headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options });
   const data = await response.json().catch(() => ({}));
+  if (response.status === 401) { window.location.href = '/'; throw new Error('登录已过期，请重新登录'); }
   if (!response.ok) throw new Error(data.error || '操作失败');
   return data;
 }
@@ -486,5 +487,5 @@ document.addEventListener('click', event => {
 $$('.tab').forEach(tab => tab.addEventListener('click', () => switchView(tab.dataset.view)));
 $('#exportBtn').addEventListener('click', async () => { const data = await api('/api/export'), blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }), link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `portfolio-backup-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(link.href); toast('备份已导出'); });
 $('#importFile').addEventListener('change', async event => { const file = event.target.files[0]; if (!file) return; try { await api('/api/import', { method: 'POST', body: await file.text() }); toast('备份已导入'); await refresh(); } catch (error) { toast(error.message); } event.target.value = ''; });
-$('#resetBtn').addEventListener('click', async () => { if (!confirm('恢复示例会覆盖当前数据，建议先导出备份。继续吗？')) return; try { await api('/api/reset-demo', { method: 'POST' }); toast('示例数据已恢复'); await refresh(); } catch (error) { toast(error.message); } });
+$('#logoutBtn').addEventListener('click', async () => { try { await api('/api/logout', { method: 'POST' }); } finally { window.location.href = '/'; } });
 refresh().catch(error => toast(error.message));
