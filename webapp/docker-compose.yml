@@ -1,0 +1,9 @@
+services:
+  portfolio:
+    build: .
+    container_name: portfolio-tracker
+    restart: unless-stopped
+    ports:
+      - "${PORTFOLIO_WEB_PORT:-18080}:8080"
+    volumes:
+      - ./data:/app/data

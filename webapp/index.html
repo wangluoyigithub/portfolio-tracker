@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>基金股票账户管理</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">PERSONAL PORTFOLIO</div>
+        <h1>基金股票账户管理</h1>
+      </div>
+      <div class="top-actions">
+        <button class="ghost" id="exportBtn">导出备份</button>
+        <label class="ghost file-btn">导入备份<input id="importFile" type="file" accept="application/json" /></label>
+        <button class="danger ghost" id="resetBtn">恢复示例</button>
+      </div>
+    </header>
+
+    <nav class="tabs" aria-label="主导航">
+      <button class="tab active" data-view="dashboard">总览</button>
+      <button class="tab" data-view="transactions">交易流水</button>
+      <button class="tab" data-view="simulator">加减仓模拟</button>
+      <button class="tab" data-view="settings">费率设置</button>
+    </nav>
+
+    <main>
+      <section id="dashboard" class="view active"></section>
+      <section id="transactions" class="view"></section>
+      <section id="simulator" class="view"></section>
+      <section id="settings" class="view"></section>
+    </main>
+  </div>
+  <div id="toast" class="toast"></div>
+  <script src="/app-v2.js"></script>
+</body>
+</html>

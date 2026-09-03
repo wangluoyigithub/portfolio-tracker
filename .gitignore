@@ -1,0 +1,15 @@
+.DS_Store
+.artifact_work/
+/node_modules
+outputs/
+build_portfolio_tracker.mjs
+__pycache__/
+*.py[cod]
+
+# 真实账户数据和本地备份不进入 GitHub
+webapp/data/*
+!webapp/data/.gitkeep
+webapp/backups/
+
+# NAS 上可自行设置端口，不提交本机配置
+webapp/.env

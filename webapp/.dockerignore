@@ -1,0 +1,7 @@
+.git
+.gitignore
+.env
+data
+backups
+__pycache__
+*.py[cod]
