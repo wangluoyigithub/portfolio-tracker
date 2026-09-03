@@ -3,7 +3,7 @@
 个人使用的基金、股票、ETF 与可转债账户管理网页。程序镜像与 SQLite 数据库分离，
 适合通过 NAS 的 Docker Compose 部署。
 
-## 使用固定版本镜像部署
+## 使用最新镜像部署
 
 下载仓库根目录的 `docker-compose.yml` 和 `.env.example`，放进 NAS 的同一个项目目录：
 
@@ -16,7 +16,7 @@ cp .env.example .env
 ```dotenv
 PORTFOLIO_BIND_IP=192.168.1.20
 PORTFOLIO_WEB_PORT=18080
-PORTFOLIO_VERSION=1.0.0
+PORTFOLIO_VERSION=latest
 ```
 
 `PORTFOLIO_BIND_IP` 必须改为 NAS 的局域网 IP。不要使用公网 IP，也不要在路由器中
@@ -42,14 +42,14 @@ docker compose run --rm backup
 
 ## 自动备份后更新
 
-修改 `.env` 中的 `PORTFOLIO_VERSION`，再执行：
+保持 `.env` 中的 `PORTFOLIO_VERSION=latest`，执行：
 
 ```bash
 ./update-image.sh
 ```
 
-脚本会先使用当前正在运行的版本创建 SQLite 一致性备份，成功后才拉取和启动新镜像。
-例如从 `1.0.0` 更新到 `1.1.0`。需要回退时把版本号改回旧版本，再运行相同命令。
+脚本会先使用当前正在运行的版本创建 SQLite 一致性备份，成功后才拉取和启动最新镜像。
+需要回退时，把版本号改为 `1.0.0` 等固定版本，再运行相同命令。
 
 ## 本地构建
 

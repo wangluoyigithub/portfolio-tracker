@@ -4,7 +4,7 @@
 
 services:
   portfolio:
-    image: ghcr.io/wangluoyigithub/portfolio-tracker:1.0.0
+    image: ghcr.io/wangluoyigithub/portfolio-tracker:latest
     container_name: portfolio-tracker
     restart: unless-stopped
     ports:
@@ -24,7 +24,7 @@ services:
       - ALL
 
   backup:
-    image: ghcr.io/wangluoyigithub/portfolio-tracker:1.0.0
+    image: ghcr.io/wangluoyigithub/portfolio-tracker:latest
     profiles: ["tools"]
     environment:
       PORTFOLIO_DB: /app/data/portfolio.db
