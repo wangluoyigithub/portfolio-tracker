@@ -10,28 +10,26 @@ python3 server.py
 
 打开 <http://127.0.0.1:8080>。
 
-## NAS / Docker 运行（GitHub 私有仓库）
+## NAS / Docker 运行（GitHub 公有仓库）
 
 程序代码放在 GitHub 私有仓库，真实账户数据只保存在 NAS 的
 `webapp/data/portfolio.db`，不会提交到 GitHub，也不会被重新构建容器覆盖。
 
 ### 首次部署
 
-在 NAS 的 Docker 项目目录克隆私有仓库，然后启动容器：
+在 NAS 的 Docker 项目目录克隆仓库，然后启动容器：
 
 ```bash
-git clone git@github.com:wangluoyigithub/portfolio-tracker.git portfolio-tracker
+git clone https://github.com/wangluoyigithub/portfolio-tracker.git portfolio-tracker
 cd portfolio-tracker/webapp
 cp .env.example .env
 docker compose up -d --build
 ```
 
-NAS 需要先配置一个可读取该私有仓库的 GitHub SSH 密钥。建议使用只读的
-Deploy key，不要把 GitHub 密码或个人访问令牌写进项目文件。
-
-默认访问地址为 `http://NAS地址:18080`。如果该端口已被占用，编辑
-`.env`，把 `PORTFOLIO_WEB_PORT` 改成其他未占用端口即可；容器内部的
-8080 不需要修改。
+部署前编辑 `.env`，把 `PORTFOLIO_BIND_IP` 设置为 NAS 的局域网 IP，例如
+`192.168.1.20`。然后通过 `http://NAS局域网IP:18080` 访问。如果端口已被占用，
+把 `PORTFOLIO_WEB_PORT` 改成其他未占用端口即可；容器内部的 8080 不需要修改。
+默认绑定 `127.0.0.1`，此时其他设备无法直接访问。
 
 ### 日常更新
 
@@ -41,7 +39,8 @@ Deploy key，不要把 GitHub 密码或个人访问令牌写进项目文件。
 ./update-nas.sh
 ```
 
-它会拉取 GitHub 最新代码、重新构建容器并显示运行状态。也可以手工执行：
+它会先为 SQLite 数据库创建一致性备份，再拉取 GitHub 最新代码、重新构建容器
+并显示运行状态。备份位于 `data/backups/`。也可以手工执行：
 
 ```bash
 git pull --ff-only

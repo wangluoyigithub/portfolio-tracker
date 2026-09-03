@@ -10,6 +10,8 @@ __pycache__/
 webapp/data/*
 !webapp/data/.gitkeep
 webapp/backups/
+/data/
 
 # NAS 上可自行设置端口，不提交本机配置
 webapp/.env
+/.env

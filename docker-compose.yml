@@ -1,10 +1,16 @@
 services:
   portfolio:
-    build: .
+    image: ghcr.io/wangluoyigithub/portfolio-tracker:${PORTFOLIO_VERSION:-1.0.0}
     container_name: portfolio-tracker
     restart: unless-stopped
     ports:
       - "${PORTFOLIO_BIND_IP:-127.0.0.1}:${PORTFOLIO_WEB_PORT:-18080}:8080"
+    environment:
+      PORTFOLIO_HOST: 0.0.0.0
+      PORTFOLIO_PORT: 8080
+      PORTFOLIO_DB: /app/data/portfolio.db
+    volumes:
+      - ./data:/app/data
     read_only: true
     tmpfs:
       - /tmp:size=16m
@@ -12,17 +18,18 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    volumes:
-      - ./data:/app/data
 
   backup:
-    build: .
+    image: ghcr.io/wangluoyigithub/portfolio-tracker:${PORTFOLIO_VERSION:-1.0.0}
     profiles: ["tools"]
+    environment:
+      PORTFOLIO_DB: /app/data/portfolio.db
+      PORTFOLIO_BACKUP_DIR: /app/data/backups
+    volumes:
+      - ./data:/app/data
     read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    volumes:
-      - ./data:/app/data
     entrypoint: ["python", "/app/backup.py"]
