@@ -20,11 +20,14 @@ python3 server.py
 在 NAS 的 Docker 项目目录克隆私有仓库，然后启动容器：
 
 ```bash
-git clone <你的私有仓库地址> portfolio-tracker
+git clone git@github.com:wangluoyigithub/portfolio-tracker.git portfolio-tracker
 cd portfolio-tracker/webapp
 cp .env.example .env
 docker compose up -d --build
 ```
+
+NAS 需要先配置一个可读取该私有仓库的 GitHub SSH 密钥。建议使用只读的
+Deploy key，不要把 GitHub 密码或个人访问令牌写进项目文件。
 
 默认访问地址为 `http://NAS地址:18080`。如果该端口已被占用，编辑
 `.env`，把 `PORTFOLIO_WEB_PORT` 改成其他未占用端口即可；容器内部的
