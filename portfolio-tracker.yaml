@@ -1,0 +1,39 @@
+# 基金股票个人账户管理 - NAS Docker Compose
+# 局域网访问时，请把下面 ports 中的 127.0.0.1 改为 NAS 的局域网 IP。
+# 不要填写公网 IP，也不要在路由器中为 18080 设置公网端口转发。
+
+services:
+  portfolio:
+    image: ghcr.io/wangluoyigithub/portfolio-tracker:1.0.0
+    container_name: portfolio-tracker
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18080:8080"
+    environment:
+      PORTFOLIO_HOST: 0.0.0.0
+      PORTFOLIO_PORT: 8080
+      PORTFOLIO_DB: /app/data/portfolio.db
+    volumes:
+      - ./data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  backup:
+    image: ghcr.io/wangluoyigithub/portfolio-tracker:1.0.0
+    profiles: ["tools"]
+    environment:
+      PORTFOLIO_DB: /app/data/portfolio.db
+      PORTFOLIO_BACKUP_DIR: /app/data/backups
+    volumes:
+      - ./data:/app/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    entrypoint: ["python", "/app/backup.py"]
