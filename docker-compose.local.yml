@@ -1,0 +1,14 @@
+services:
+  portfolio:
+    build:
+      context: ./webapp
+    container_name: portfolio-tracker
+    restart: unless-stopped
+    ports:
+      - "${PORTFOLIO_WEB_PORT:-18080}:8080"
+    environment:
+      PORTFOLIO_HOST: 0.0.0.0
+      PORTFOLIO_PORT: 8080
+      PORTFOLIO_DB: /app/data/portfolio.db
+    volumes:
+      - ./webapp/data:/app/data
