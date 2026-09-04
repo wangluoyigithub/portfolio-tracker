@@ -7,6 +7,9 @@ import secrets
 import sqlite3
 import time
 import uuid
+import base64
+import io
+import re
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +36,8 @@ DEFAULT_SETTINGS = {
     'fund_buy_rate': 0.0015, 'fund_sell_rate': 0.005,
 }
 
+PDF_TRANSACTION_TYPES = ('定投买入', '用户买入', '营销买入', '用户认购', '定投卖出', '用户卖出', '用户跨TA转换', '分红')
+
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -46,7 +51,7 @@ def db():
         other_fee REAL NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '')''')
     conn.execute('''CREATE TABLE IF NOT EXISTS prices (
         code TEXT PRIMARY KEY, name TEXT NOT NULL, asset_type TEXT NOT NULL,
-        price REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)''')
+        price REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, pnl_override REAL)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY, value REAL NOT NULL)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS fund_rules (
@@ -70,6 +75,10 @@ def db():
         username TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
         salt TEXT NOT NULL, iterations INTEGER NOT NULL,
         created_at TEXT NOT NULL)''')
+    price_columns = {row[1] for row in conn.execute('PRAGMA table_info(prices)')}
+    if 'pnl_override' not in price_columns:
+        conn.execute('ALTER TABLE prices ADD COLUMN pnl_override REAL')
+    # 旧版本数据库保持兼容；PDF 导入使用 note 保存原订单号和转换编号。
     for key, value in DEFAULT_SETTINGS.items():
         conn.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
     template = [{'min_days': 0, 'max_days': 7, 'rate': 0.015}, {'min_days': 7, 'max_days': 30, 'rate': 0.0075}, {'min_days': 30, 'max_days': 180, 'rate': 0.005}, {'min_days': 180, 'max_days': 360, 'rate': 0}, {'min_days': 360, 'max_days': None, 'rate': 0}]
@@ -103,6 +112,126 @@ def db():
                 conn.execute(f'UPDATE {table} SET redemption_tiers=?, updated_at=? WHERE {where}', (json.dumps(tiers, ensure_ascii=False), date.today().isoformat(), *params))
     conn.commit()
     return conn
+
+
+def _pdf_number(value):
+    try:
+        return float(str(value).replace(',', ''))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pdf_date(value):
+    match = re.search(r'(20\d{2})/(\d{1,2})/(\d{1,2})', str(value))
+    return f'{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}' if match else ''
+
+
+def _normalize_pdf_text(text):
+    text = str(text or '').replace('\u00a0', ' ')
+    text = re.sub(r'(\d{4}/\d{2}/\d)\s+(\d)', r'\1\2', text)
+    text = re.sub(r'(20\d{2}/\d{2}/\d)\s+(\d)', r'\1\2', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def parse_fund_pdf(pdf_bytes):
+    """Parse Ant fund statement rows into the application's transaction shape.
+
+    The statement is text based but table cells may wrap across lines. We split on
+    the leading YYYYMMDD trade date, then parse the stable numeric tail after the
+    six-digit fund code. No file is persisted by this function.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise ValueError('服务器未安装 PDF 解析组件，请重新构建镜像') from exc
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = _normalize_pdf_text(' '.join(page.extract_text() or '' for page in reader.pages))
+    chunks = re.split(r'(?=(?:^|\s)(20\d{6})(?:\s|$))', text)
+    rows, warnings = [], []
+    # re.split with a capturing group leaves the date as a separate item.
+    rebuilt = []
+    index = 0
+    while index < len(chunks):
+        item = chunks[index].strip()
+        if re.fullmatch(r'20\d{6}', item) and index + 1 < len(chunks):
+            rebuilt.append(item + ' ' + chunks[index + 1].strip())
+            index += 2
+        else:
+            index += 1
+    last_conversion_by_date = {}
+    for chunk in rebuilt:
+        type_match = re.search(r'(定投买入|用户买入|营销买入|用户认购|定投卖出|用户卖出|用户跨\s*TA转换|分红)', chunk)
+        if not type_match:
+            continue
+        transaction_type = re.sub(r'\s+', '', type_match.group(1))
+        trade_date_raw = re.match(r'(20\d{6})', chunk)
+        if not trade_date_raw:
+            continue
+        trade_date = f'{trade_date_raw.group(1)[:4]}-{trade_date_raw.group(1)[4:6]}-{trade_date_raw.group(1)[6:]}'
+        prefix = chunk[:type_match.start()]
+        order_numbers = re.findall(r'(?<!\d)\d{8}(?!\d)', prefix)
+        order_id = order_numbers[-1] if order_numbers else ''
+        # Page breaks can leave only the transfer-account constants before a
+        # continuation row. Reuse the preceding transfer order for that date.
+        if order_id in ('00108007', '00041500', '22041500', '24041500'):
+            order_id = last_conversion_by_date.get(trade_date_raw.group(1), order_id)
+        code_matches = list(re.finditer(r'(?<!\d)\d{6}(?!\d)', chunk[type_match.end():]))
+        if not code_matches:
+            warnings.append(f'{trade_date} {transaction_type}：未找到基金代码')
+            continue
+        code_match = code_matches[0]
+        code = code_match.group(0)
+        name = re.sub(r'\s+', '', chunk[type_match.end():type_match.end() + code_match.start()]).strip()
+        # Keep punctuation and letters in names, but discard a stray page marker.
+        name = re.sub(r'\d+\s*/\s*\d+', '', name).strip() or code
+        tail = chunk[type_match.end() + code_match.end():]
+        confirm_match = re.search(r'(20\d{2}/\d{2}/\d{2})', tail)
+        confirm_date = _pdf_date(confirm_match.group(1)) if confirm_match else trade_date
+        numeric_tail = tail[:confirm_match.start()] if confirm_match else tail
+        numbers = re.findall(r'(?<![\d.])\d+(?:\.\d+)?', numeric_tail)
+        slash = '/' in numeric_tail
+        try:
+            if slash and len(numbers) >= 4:
+                app_amount, confirm_amount, confirm_shares, fee = map(_pdf_number, numbers[:4])
+                action = '买入'
+                quantity = confirm_shares
+                price = (confirm_amount - fee) / quantity if quantity else 0.0
+                # For conversion-in rows the application/confirmation amount is
+                # the transferred principal, and the same buy representation applies.
+            elif len(numbers) >= 5:
+                _, app_shares, confirm_amount, confirm_shares, fee = map(_pdf_number, numbers[:5])
+                action = '卖出'
+                quantity = confirm_shares or app_shares
+                price = confirm_amount / quantity if quantity else 0.0
+            else:
+                warnings.append(f'{trade_date} {code}：金额或份额列无法识别')
+                continue
+        except (TypeError, ValueError):
+            warnings.append(f'{trade_date} {code}：数字格式无法识别')
+            continue
+        if transaction_type == '分红':
+            warnings.append(f'{trade_date} {code}：分红记录暂不自动导入，请在预览中核对')
+            continue
+        conversion_id = f'{trade_date_raw.group(1)}-{order_id}' if transaction_type == '用户跨TA转换' else ''
+        if conversion_id:
+            last_conversion_by_date[trade_date_raw.group(1)] = order_id
+        note = f'PDF导入 · {transaction_type} · 订单号 {order_id}'
+        if conversion_id:
+            note += f' · 跨TA转换 {conversion_id}'
+        rows.append({'id': str(uuid.uuid4()), 'date': confirm_date, 'account': '默认账户',
+                     'asset_type': '基金', 'code': code, 'name': name, 'action': action,
+                     'quantity': quantity, 'price': max(0.0, price),
+                     'buy_fee': fee if action == '买入' else 0.0,
+                     'sell_fee': fee if action == '卖出' else 0.0,
+                     'tax': 0.0, 'other_fee': 0.0, 'note': note})
+    if not rows:
+        raise ValueError('没有识别到基金交易明细，请确认 PDF 是蚂蚁基金交易明细原文件')
+    conversion_ids = {match.group(1) for row in rows for match in [re.search(r'跨TA转换 (\d{8}-\d{8})', row['note'])] if match}
+    return {'transactions': rows, 'pages': len(reader.pages), 'warnings': warnings,
+            'conversion_count': len(conversion_ids),
+            'buy_count': sum(1 for row in rows if row['action'] == '买入'),
+            'sell_count': sum(1 for row in rows if row['action'] == '卖出')}
 
 
 def auth_user(conn):
@@ -210,6 +339,34 @@ def all_sale_allocations(conn):
     return [row_to_dict(r) for r in conn.execute('SELECT * FROM fund_sale_allocations ORDER BY buy_date, id')]
 
 
+def imported_sale_allocations(transactions, candidate):
+    """Allocate a statement sell fee across FIFO lots while preserving its amount."""
+    if candidate.get('asset_type') != '基金' or candidate.get('action') != '卖出':
+        return []
+    qty = number(candidate.get('quantity'))
+    sale_fee = number(candidate.get('sell_fee'))
+    if qty <= 0:
+        return []
+    lots = build_fund_lots(transactions, str(candidate.get('account', '')).strip(), str(candidate.get('code', '')).strip())
+    left, base_total = qty, 0.0
+    selected = []
+    for lot in lots:
+        if left <= 1e-8:
+            break
+        used = min(left, number(lot.get('quantity')))
+        base = used * number(candidate.get('price'))
+        selected.append((lot, used, base))
+        base_total += base
+        left -= used
+    if left > 1e-8:
+        raise ValueError(f"{candidate.get('code')} 卖出数量超过导入前持仓（缺少 {left:.4f} 份历史买入记录）")
+    return [{'id': str(uuid.uuid4()), 'sale_tx_id': candidate['id'], 'buy_tx_id': lot.get('buy_tx_id', ''),
+             'account': candidate.get('account', ''), 'code': candidate.get('code', ''), 'buy_date': lot.get('date', ''),
+             'quantity': used, 'holding_days': days_between(lot.get('date', ''), candidate.get('date', '')),
+             'rate': (sale_fee * base / base_total / base) if sale_fee and base_total and base else 0.0,
+             'fee': sale_fee * base / base_total if base_total else 0.0} for lot, used, base in selected]
+
+
 def days_between(start, end):
     try:
         a = datetime.strptime(str(start)[:10], '%Y-%m-%d').date()
@@ -290,14 +447,16 @@ def calculate(transactions, prices, fund_rules=None):
             dividend = amount - other_fee
             st['dividends'] += dividend
             st['net_cash_invested'] -= dividend
-    price_map = {str(p['code']): number(p.get('price')) for p in prices}
+    price_map = {str(p['code']): p for p in prices}
     result = []
     for (_, code), st in states.items():
         quantity = st['quantity']
-        current = price_map.get(code, 0.0)
+        price_record = price_map.get(code, {})
+        current = number(price_record.get('price'))
         market_value = quantity * current
         avg_cost = st['book_cost'] / quantity if quantity else 0.0
-        unrealized = market_value - st['book_cost']
+        manual_pnl = price_record.get('pnl_override')
+        unrealized = number(manual_pnl) if manual_pnl is not None else market_value - st['book_cost']
         total = unrealized + st['realized_pnl'] + st['dividends']
         break_even = max(0.0, (st['book_cost'] - st['realized_pnl'] - st['dividends']) / quantity) if quantity else 0.0
         invested = st['net_cash_invested']
@@ -433,7 +592,7 @@ def replace_state(conn, transactions, prices, settings=None, fund_rules=None, te
         tx = {**tx, 'id': tx.get('id') or str(uuid.uuid4())}
         conn.execute('INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (tx['id'], tx.get('date', ''), tx.get('account', ''), tx.get('asset_type', '基金'), tx.get('code', ''), tx.get('name', ''), tx.get('action', '买入'), number(tx.get('quantity')), number(tx.get('price')), number(tx.get('buy_fee')), number(tx.get('sell_fee')), number(tx.get('tax')), number(tx.get('other_fee')), tx.get('note', '')))
     for p in prices:
-        conn.execute('INSERT OR REPLACE INTO prices VALUES (?,?,?,?,?)', (str(p['code']), p.get('name', ''), p.get('asset_type', '基金'), number(p.get('price')), p.get('updated_at', date.today().isoformat())))
+        conn.execute('INSERT OR REPLACE INTO prices VALUES (?,?,?,?,?,?)', (str(p['code']), p.get('name', ''), p.get('asset_type', '基金'), number(p.get('price')), p.get('updated_at', date.today().isoformat()), p.get('pnl_override')))
     for key, value in (settings or {}).items():
         if key in DEFAULT_SETTINGS:
             conn.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, number(value)))
@@ -552,7 +711,7 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute('INSERT INTO fund_sale_allocations VALUES (?,?,?,?,?,?,?,?,?,?)', (str(uuid.uuid4()), candidate['id'], item.get('buy_tx_id', ''), candidate['account'], candidate['code'], item.get('date', ''), number(item.get('quantity')), int(item.get('holding_days', 0)), number(item.get('rate')), number(item.get('fee'))))
                 conn.commit(); conn.close(); self.send_json({'ok': True, 'id': candidate['id']}); return
             if path == '/api/prices':
-                conn.execute('INSERT OR REPLACE INTO prices VALUES (?,?,?,?,?)', (str(payload.get('code', '')).strip(), payload.get('name', ''), payload.get('asset_type', '基金'), number(payload.get('price')), date.today().isoformat())); conn.commit(); conn.close(); self.send_json({'ok': True}); return
+                conn.execute('INSERT OR REPLACE INTO prices VALUES (?,?,?,?,?,?)', (str(payload.get('code', '')).strip(), payload.get('name', ''), payload.get('asset_type', '基金'), number(payload.get('price')), date.today().isoformat(), payload.get('pnl_override'))); conn.commit(); conn.close(); self.send_json({'ok': True}); return
             if path == '/api/settings':
                 for key, value in payload.items():
                     if key in DEFAULT_SETTINGS:
@@ -583,6 +742,87 @@ class Handler(BaseHTTPRequestHandler):
                 q, p = number(payload.get('quantity')), number(payload.get('price')); cash_flow = -(q * p + number(payload.get('buy_fee')) + number(payload.get('other_fee'))) if action == '买入' else q * p - number(payload.get('sell_fee')) - number(payload.get('tax')) - number(payload.get('other_fee'))
                 preview = fee_preview(conn, tx, {**payload, 'operation': operation, 'date': sim_date}) if operation == '减仓' else {}
                 self.send_json({'before': now, 'after': later, 'cash_flow': cash_flow, 'lot_preview': preview.get('lot_preview', [])}); conn.close(); return
+            if path == '/api/import-pdf-preview':
+                encoded = str(payload.get('data', ''))
+                if not encoded: raise ValueError('请选择 PDF 文件')
+                try:
+                    pdf_bytes = base64.b64decode(encoded, validate=True)
+                except (ValueError, TypeError):
+                    raise ValueError('PDF 文件内容无效')
+                if len(pdf_bytes) > 30 * 1024 * 1024:
+                    raise ValueError('PDF 文件不能超过 30MB')
+                result = parse_fund_pdf(pdf_bytes)
+                result['filename'] = str(payload.get('filename', '基金交易流水.pdf'))[:200]
+                conn.close(); self.send_json(result); return
+            if path == '/api/import-pdf':
+                incoming = payload.get('transactions')
+                if not isinstance(incoming, list) or not incoming:
+                    raise ValueError('没有可导入的交易记录')
+                incoming = sorted(incoming, key=lambda item: (str(item.get('date', ''))[:10], str(item.get('id', ''))))
+                account = str(payload.get('account', '')).strip() or '默认账户'
+                existing = all_transactions(conn)
+                existing_keys = {(str(item.get('account', '')), str(item.get('note', '')), str(item.get('code', '')), str(item.get('action', '')), str(item.get('date', '')), number(item.get('quantity')), number(item.get('price')), number(item.get('buy_fee')), number(item.get('sell_fee'))) for item in existing if item.get('note')}
+                inserted, skipped, allocations, opening_count = [], 0, [], 0
+                statement_start = min((str(item.get('date', ''))[:10] for item in incoming if item.get('date')), default=date.today().isoformat())
+                for item in incoming:
+                    candidate = {**item, 'id': item.get('id') or str(uuid.uuid4()), 'account': account,
+                                 'asset_type': '基金', 'code': str(item.get('code', '')).strip(),
+                                 'name': str(item.get('name', '')).strip() or str(item.get('code', '')).strip(),
+                                 'action': item.get('action') if item.get('action') in ('买入', '卖出') else '买入'}
+                    candidate['quantity'] = number(candidate.get('quantity')); candidate['price'] = number(candidate.get('price'))
+                    candidate['buy_fee'] = number(candidate.get('buy_fee')); candidate['sell_fee'] = number(candidate.get('sell_fee'))
+                    candidate['tax'] = number(candidate.get('tax')); candidate['other_fee'] = number(candidate.get('other_fee'))
+                    key = (account, str(candidate.get('note', '')), candidate['code'], candidate['action'], str(candidate.get('date', '')), candidate['quantity'], candidate['price'], candidate['buy_fee'], candidate['sell_fee'])
+                    if key[0] and key in existing_keys:
+                        skipped += 1; continue
+                    if not candidate['code'] or candidate['quantity'] <= 0 or candidate['price'] < 0:
+                        raise ValueError('导入记录缺少基金代码、份额或价格')
+                    current = existing + inserted
+                    if candidate['action'] == '卖出':
+                        available = sum(number(lot.get('quantity')) for lot in build_fund_lots(current, account, candidate['code']))
+                        missing = max(0.0, candidate['quantity'] - available)
+                        if missing > 1e-8:
+                            # A statement may begin after an older position was
+                            # acquired. Add an explicit zero-cost opening lot so
+                            # the historical sell can still be represented, and
+                            # surface it as a note for later cost correction.
+                            opening = {'id': str(uuid.uuid4()), 'date': statement_start, 'account': account,
+                                       'asset_type': '基金', 'code': candidate['code'], 'name': candidate['name'],
+                                       'action': '买入', 'quantity': missing, 'price': 0.0, 'buy_fee': 0.0,
+                                       'sell_fee': 0.0, 'tax': 0.0, 'other_fee': 0.0,
+                                       'note': f"PDF导入 · 期初持仓补齐（成本待核对） · {candidate['code']}"}
+                            conn.execute('INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', tuple(opening.get(k, '') for k in ('id', 'date', 'account', 'asset_type', 'code', 'name', 'action', 'quantity', 'price', 'buy_fee', 'sell_fee', 'tax', 'other_fee', 'note')))
+                            inserted.append(opening); opening_count += 1
+                            current = existing + inserted
+                        try:
+                            allocations.extend(imported_sale_allocations(current, candidate))
+                        except ValueError:
+                            # Same-day rows can be ordered differently in a PDF
+                            # than in the source ledger. Keep the sell visible by
+                            # adding an explicit, reviewable opening lot.
+                            opening = {'id': str(uuid.uuid4()), 'date': statement_start, 'account': account,
+                                       'asset_type': '基金', 'code': candidate['code'], 'name': candidate['name'],
+                                       'action': '买入', 'quantity': candidate['quantity'], 'price': 0.0, 'buy_fee': 0.0,
+                                       'sell_fee': 0.0, 'tax': 0.0, 'other_fee': 0.0,
+                                       'note': f"PDF导入 · 期初持仓补齐（成本待核对） · {candidate['code']}"}
+                            conn.execute('INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', tuple(opening.get(k, '') for k in ('id', 'date', 'account', 'asset_type', 'code', 'name', 'action', 'quantity', 'price', 'buy_fee', 'sell_fee', 'tax', 'other_fee', 'note')))
+                            inserted.append(opening); opening_count += 1
+                            allocations.extend(imported_sale_allocations(existing + inserted, candidate))
+                    conn.execute('INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', tuple(candidate.get(k, '') for k in ('id', 'date', 'account', 'asset_type', 'code', 'name', 'action', 'quantity', 'price', 'buy_fee', 'sell_fee', 'tax', 'other_fee', 'note')))
+                    inserted.append(candidate); existing_keys.add(key)
+                # Give newly imported funds a usable common redemption rule without
+                # overwriting an existing account-specific rule.
+                template_row = conn.execute("SELECT redemption_tiers FROM fund_rule_templates WHERE id='common'").fetchone()
+                default_tiers = template_row['redemption_tiers'] if template_row else '[]'
+                for item in inserted:
+                    if not conn.execute('SELECT 1 FROM fund_rules_v2 WHERE account=? AND code=?', (account, item['code'])).fetchone():
+                        conn.execute('INSERT INTO fund_rules_v2 VALUES (?,?,?,?,?,?,?,?)', (account, item['code'], item['name'], 0.0, 0.0, 'external', default_tiers, date.today().isoformat()))
+                for item in allocations:
+                    conn.execute('INSERT INTO fund_sale_allocations VALUES (?,?,?,?,?,?,?,?,?,?)', tuple(item.get(k, '') for k in ('id', 'sale_tx_id', 'buy_tx_id', 'account', 'code', 'buy_date', 'quantity', 'holding_days', 'rate', 'fee')))
+                # Validate the entire resulting ledger before committing.
+                calculate(all_transactions(conn), all_prices(conn), fund_rule_map(conn))
+                conversion_ids = {match.group(1) for item in inserted for match in [re.search(r'跨TA转换 (\d{8}-\d{8})', item.get('note', ''))] if match}
+                conn.commit(); conn.close(); self.send_json({'ok': True, 'inserted': len(inserted), 'skipped': skipped, 'opening_count': opening_count, 'conversion_count': len(conversion_ids)}); return
             if path == '/api/import':
                 replace_state(conn, payload.get('transactions', []), payload.get('prices', []), payload.get('settings'), payload.get('fund_rules'), payload.get('fund_rule_templates'), payload.get('sale_allocations')); conn.close(); self.send_json({'ok': True}); return
             conn.close(); self.send_json({'error': '未找到接口'}, 404)

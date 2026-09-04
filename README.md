@@ -63,3 +63,5 @@ docker compose -f docker-compose.local.yml up -d --build portfolio
 ```
 
 更多使用说明见 [webapp/README.md](webapp/README.md)。
+
+添加持仓时，股票、ETF 和可转债使用市值、成本、持仓数量和手工盈亏录入；基金可以手工填写当前持仓，也可以在同一窗口导入 PDF 交易流水。

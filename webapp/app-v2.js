@@ -278,29 +278,34 @@ function modal(title, body) {
 function closeModal() { $('#activeModal')?.remove(); }
 function selectedAccount(form) { return form.account_select.value === '__new__' ? form.new_account.value.trim() : form.account_select.value; }
 
+function snapshotFields() {
+  return `<div class="snapshot-fields form-grid" style="grid-column:1/-1"><div class="field"><label>市值</label><input class="input snapshot-market" name="market_value" type="number" min="0" step="0.01" placeholder="当前持仓市值"></div><div class="field"><label>成本</label><input class="input snapshot-cost" name="book_cost" type="number" min="0" step="0.01" placeholder="持仓总成本"></div><div class="field"><label>持仓数量</label><input class="input snapshot-quantity" name="holding_quantity" type="number" min="0" step="0.0001" placeholder="当前持仓数量"></div><div class="field"><label>盈亏</label><input class="input snapshot-pnl" name="pnl" type="number" step="0.01" placeholder="手工填写盈亏"></div></div>`;
+}
+
 function openPositionModal() {
   const defaultRuleSource = `template:${commonRuleTemplate()?.id || ''}`;
-  const body = `<p class="hint">保存后生成一笔初始买入交易，进入同一套成本与历史流水。</p><form id="positionForm" class="form-grid">
+  const body = `<p class="hint">手工录入会生成一笔初始买入交易；基金也可以直接导入 PDF 交易流水。</p><form id="positionForm" class="form-grid">
     <div class="field"><label>账户</label>${accountSelect('account_select')}</div><div class="field new-account-field"><label>新账户名称</label><input class="input" name="new_account" placeholder="输入一次，以后可下拉选择"></div>
-    <div class="field"><label>类型</label><select class="input" name="asset_type"><option>基金</option><option>股票</option><option>ETF</option><option>可转债</option></select></div>
-    <div class="field"><label>代码</label><div class="inline-field"><input class="input" name="code" required><button class="ghost" id="positionLookup" type="button">查询</button></div></div>
-    <div class="field"><label>名称</label><input class="input" name="name" required></div><div class="field"><label>确认日期</label><input class="input" name="date" type="date" value="${new Date().toISOString().slice(0, 10)}" required></div>
-    ${calculatorFields('position')}
-    <div class="field"><label>手续费</label><input class="input fee-display" readonly value="0.00"></div>
+    <div class="field"><label>类型</label><select class="input" name="asset_type"><option>股票</option><option>ETF</option><option>可转债</option><option>基金</option></select></div>
+    <div class="fund-entry-field field" style="display:none"><label>基金持仓来源</label><select class="input" name="entry_mode"><option value="manual">手工填写当前持仓</option><option value="pdf">导入 PDF 交易流水</option></select></div>
+    <div class="code-field field"><label>代码</label><div class="inline-field"><input class="input" name="code"><button class="ghost" id="positionLookup" type="button">查询</button></div></div>
+    <div class="name-field field"><label>名称</label><input class="input" name="name"></div><div class="date-field field"><label>确认日期</label><input class="input" name="date" type="date" value="${new Date().toISOString().slice(0, 10)}" required></div>
+    ${snapshotFields()}
+    <div class="pdf-fields subpanel" style="display:none;grid-column:1/-1"><div class="panel-title"><h3>导入基金交易流水</h3></div><p class="hint">选择 PDF 后先解析预览，确认提交后才会写入交易流水。</p><input class="input pdf-file" type="file" accept="application/pdf,.pdf"><div class="pdf-preview empty">尚未选择 PDF。</div></div>
     <div class="fund-fields subpanel" style="grid-column:1/-1"><div class="panel-title"><h3>基金费率</h3></div><div class="form-grid"><div class="field"><label>买入费率</label>${rateSelect(0)}</div><div class="field custom-rate-field" style="display:none"><label>自定义买入费率（%）</label><input class="input custom-rate" type="number" min="0" step="0.01" value="0"></div><div class="field"><label>赎回规则</label><select class="input rule-source">${ruleSourceOptions(defaultRuleSource)}</select></div></div><div class="tier-editor"></div><div class="form-actions"><button class="ghost add-tier" type="button">增加一档</button><button class="ghost save-template" type="button">另存为模板</button></div></div>
     <div class="form-actions" style="grid-column:1/-1"><button class="primary" type="submit">保存持仓</button></div></form>`;
   const root = modal('添加持仓', body), form = $('#positionForm');
-  const calculator = bindCalculator(root, () => updatePositionFee(form, calculator), { grossFactor: () => form.asset_type.value === '基金' ? 1 + selectedBuyRate(root) : 1 });
+  let pdfPreview = null;
   const updateAccount = () => { root.querySelector('.new-account-field').style.display = form.account_select.value === '__new__' ? 'flex' : 'none'; };
-  const updateType = () => { root.querySelector('.fund-fields').style.display = form.asset_type.value === '基金' ? 'block' : 'none'; recalculateAmount(calculator); updatePositionFee(form, calculator); };
-  form.account_select.addEventListener('change', updateAccount); form.asset_type.addEventListener('change', updateType);
-  root.querySelector('.buy-rate-select').addEventListener('change', event => { root.querySelector('.custom-rate-field').style.display = event.target.value === 'custom' ? 'flex' : 'none'; recalculateAmount(calculator); updatePositionFee(form, calculator); });
-  root.querySelector('.custom-rate').addEventListener('input', () => { recalculateAmount(calculator); updatePositionFee(form, calculator); });
+  const updateType = () => { const fund = form.asset_type.value === '基金'; const pdf = fund && form.entry_mode.value === 'pdf'; root.querySelector('.fund-entry-field').style.display = fund ? 'flex' : 'none'; root.querySelector('.fund-fields').style.display = fund && !pdf ? 'block' : 'none'; root.querySelector('.snapshot-fields').style.display = pdf ? 'none' : 'grid'; root.querySelector('.pdf-fields').style.display = pdf ? 'block' : 'none'; root.querySelector('.code-field').style.display = pdf ? 'none' : 'flex'; root.querySelector('.name-field').style.display = pdf ? 'none' : 'flex'; root.querySelector('.date-field').style.display = pdf ? 'none' : 'flex'; root.querySelector('button[type="submit"]').textContent = pdf ? '确认导入' : '保存持仓'; };
+  form.account_select.addEventListener('change', updateAccount); form.asset_type.addEventListener('change', updateType); form.entry_mode.addEventListener('change', updateType);
+  root.querySelector('.buy-rate-select').addEventListener('change', event => { root.querySelector('.custom-rate-field').style.display = event.target.value === 'custom' ? 'flex' : 'none'; });
   root.querySelector('.rule-source').addEventListener('change', event => applyRuleSource(event.target.value, root));
   root.querySelector('.add-tier').addEventListener('click', () => appendTier(root.querySelector('.tier-editor')));
   root.querySelector('.save-template').addEventListener('click', () => saveTemplateFrom(root));
-  $('#positionLookup').addEventListener('click', async () => { try { const item = await lookupAsset(form.code.value.trim()); form.code.value = item.code; form.name.value = item.name; form.asset_type.value = item.asset_type; if (item.price) calculator.price.value = item.price; updateType(); toast(`已识别：${item.name}`); } catch (error) { toast(error.message); } });
-  form.addEventListener('submit', event => saveNewPosition(event, root, calculator));
+  root.querySelector('.pdf-file').addEventListener('change', event => { const file = event.target.files[0]; if (!file) return; const preview = root.querySelector('.pdf-preview'); preview.textContent = '正在解析…'; const reader = new FileReader(); reader.onload = async () => { try { const result = await api('/api/import-pdf-preview', { method: 'POST', body: JSON.stringify({ filename: file.name, data: String(reader.result).split(',')[1] }) }); pdfPreview = result; preview.innerHTML = `<strong>${esc(file.name)}</strong><br>共 ${result.pages} 页，识别买入 ${result.buy_count} 笔、卖出 ${result.sell_count} 笔，其中跨 TA 转换 ${result.conversion_count} 笔。${result.warnings?.length ? `<p class="negative">需核对：${esc(result.warnings.slice(0, 3).join('；'))}${result.warnings.length > 3 ? '…' : ''}</p>` : '<p class="positive">未发现解析异常。</p>'}`; } catch (error) { pdfPreview = null; preview.textContent = error.message; } }; reader.readAsDataURL(file); });
+  root.querySelector('#positionLookup').addEventListener('click', async () => { try { const item = await lookupAsset(form.code.value.trim()); form.code.value = item.code; form.name.value = item.name; form.asset_type.value = item.asset_type; updateType(); toast(`已识别：${item.name}`); } catch (error) { toast(error.message); } });
+  form.addEventListener('submit', event => saveNewPosition(event, root, pdfPreview));
   setTierEditor(root.querySelector('.tier-editor'), commonRuleTemplate()?.redemption_tiers || []);
   updateAccount(); updateType();
 }
@@ -340,17 +345,19 @@ async function saveTemplateFrom(root) {
   try { await api('/api/fund-rule-templates', { method: 'POST', body: JSON.stringify({ name, redemption_tiers: collectTiers(root.querySelector('.tier-editor')) }) }); toast('规则模板已保存'); await refresh(); } catch (error) { toast(error.message); }
 }
 
-async function saveNewPosition(event, root, calculator) {
+async function saveNewPosition(event, root, pdfPreview) {
   event.preventDefault();
-  const form = event.currentTarget, account = selectedAccount(form), code = form.code.value.trim(), assetType = form.asset_type.value;
+  const form = event.currentTarget, account = selectedAccount(form), code = form.code.value.trim(), assetType = form.asset_type.value, pdfMode = assetType === '基金' && form.entry_mode.value === 'pdf';
   if (!account) return toast('请选择或填写账户');
-  const qty = num(calculator.qty.value), price = num(calculator.price.value);
-  if (!code || !qty || !price) return toast('请填写代码，并在金额、数量、净值中至少填写两项');
+  if (pdfMode) { if (!pdfPreview?.transactions?.length) return toast('请先选择并解析 PDF 交易流水'); try { const result = await api('/api/import-pdf', { method: 'POST', body: JSON.stringify({ account, transactions: pdfPreview.transactions }) }); closeModal(); toast(`已导入 ${result.inserted} 笔基金交易${result.skipped ? `，跳过 ${result.skipped} 笔重复记录` : ''}`); await refresh(); } catch (error) { toast(error.message); } return; }
+  const qty = num(form.holding_quantity.value), cost = num(form.book_cost.value), market = num(form.market_value.value), pnl = num(form.pnl.value), price = qty ? cost / qty : 0;
+  if (!code || !form.name.value.trim() || !qty) return toast('请填写代码、名称和持仓数量');
+  if (form.pnl.value.trim() === '') return toast('请填写盈亏');
+  if (cost < 0 || market < 0) return toast('市值和成本不能为负数');
   try {
     if (assetType === '基金') await api('/api/fund-rules', { method: 'POST', body: JSON.stringify({ account, code, name: form.name.value, buy_rate: selectedBuyRate(root), buy_mode: 'external', redemption_tiers: collectTiers(root.querySelector('.tier-editor')) }) });
-    const fee = await feePreview({ account, code, asset_type: assetType, operation: '加仓', quantity: qty, price, date: form.date.value });
-    await api('/api/transactions', { method: 'POST', body: JSON.stringify({ date: form.date.value, account, asset_type: assetType, code, name: form.name.value, action: '买入', quantity: qty, price, buy_fee: num(fee.buy_fee), sell_fee: 0, tax: 0, other_fee: 0, note: '' }) });
-    await api('/api/prices', { method: 'POST', body: JSON.stringify({ code, name: form.name.value, asset_type: assetType, price }) });
+    await api('/api/transactions', { method: 'POST', body: JSON.stringify({ date: form.date.value, account, asset_type: assetType, code, name: form.name.value, action: '买入', quantity: qty, price, buy_fee: 0, sell_fee: 0, tax: 0, other_fee: 0, note: '手工录入当前持仓（初始成本）' }) });
+    await api('/api/prices', { method: 'POST', body: JSON.stringify({ code, name: form.name.value, asset_type: assetType, price: qty ? market / qty : 0, pnl_override: pnl }) });
     closeModal(); toast('持仓已添加，并生成初始买入流水'); await refresh();
   } catch (error) { toast(error.message); }
 }

@@ -70,6 +70,8 @@ tbody tr:hover { background: #fbfdff; }
 .inline-field { display: flex; gap: 6px; align-items: center; }
 .inline-field .ghost { white-space: nowrap; padding: 8px 10px; }
 .subpanel { border: 1px dashed #d9e2f0; border-radius: 10px; padding: 13px; background: #fbfdff; }
+.snapshot-pnl { background: #f7f9fc; font-weight: 700; }
+.pdf-preview { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #fff; text-align: left; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; padding: 18px; background: rgba(23,32,51,.35); }
 .modal { width: min(760px, 100%); max-height: 92vh; overflow: auto; background: var(--panel); border-radius: 14px; padding: 20px; box-shadow: 0 24px 70px rgba(23,32,51,.24); }
 .modal > .panel-title { margin-bottom: 4px; }
