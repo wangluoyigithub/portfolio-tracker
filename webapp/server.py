@@ -71,6 +71,13 @@ def db():
         id TEXT PRIMARY KEY, sale_tx_id TEXT NOT NULL, buy_tx_id TEXT NOT NULL,
         account TEXT NOT NULL, code TEXT NOT NULL, buy_date TEXT NOT NULL,
         quantity REAL NOT NULL, holding_days INTEGER NOT NULL, rate REAL NOT NULL, fee REAL NOT NULL)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS position_archives (
+        id TEXT PRIMARY KEY, account TEXT NOT NULL, code TEXT NOT NULL,
+        name TEXT NOT NULL, asset_type TEXT NOT NULL, archived_at TEXT NOT NULL,
+        start_date TEXT NOT NULL DEFAULT '', end_date TEXT NOT NULL DEFAULT '',
+        realized_pnl REAL NOT NULL DEFAULT 0, total_pnl REAL NOT NULL DEFAULT 0,
+        notes TEXT NOT NULL DEFAULT '', transactions_json TEXT NOT NULL DEFAULT '[]',
+        allocations_json TEXT NOT NULL DEFAULT '[]')''')
     conn.execute('''CREATE TABLE IF NOT EXISTS auth_users (
         username TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
         salt TEXT NOT NULL, iterations INTEGER NOT NULL,
@@ -339,6 +346,22 @@ def all_sale_allocations(conn):
     return [row_to_dict(r) for r in conn.execute('SELECT * FROM fund_sale_allocations ORDER BY buy_date, id')]
 
 
+def all_archives(conn):
+    result = []
+    for row in conn.execute('SELECT * FROM position_archives ORDER BY archived_at DESC, id DESC'):
+        item = row_to_dict(row)
+        try:
+            item['transactions'] = json.loads(item.pop('transactions_json') or '[]')
+        except (TypeError, ValueError):
+            item['transactions'] = []
+        try:
+            item['sale_allocations'] = json.loads(item.pop('allocations_json') or '[]')
+        except (TypeError, ValueError):
+            item['sale_allocations'] = []
+        result.append(item)
+    return result
+
+
 def imported_sale_allocations(transactions, candidate):
     """Allocate a statement sell fee across FIFO lots while preserving its amount."""
     if candidate.get('asset_type') != '基金' or candidate.get('action') != '卖出':
@@ -455,8 +478,7 @@ def calculate(transactions, prices, fund_rules=None):
         current = number(price_record.get('price'))
         market_value = quantity * current
         avg_cost = st['book_cost'] / quantity if quantity else 0.0
-        manual_pnl = price_record.get('pnl_override')
-        unrealized = number(manual_pnl) if manual_pnl is not None else market_value - st['book_cost']
+        unrealized = market_value - st['book_cost']
         total = unrealized + st['realized_pnl'] + st['dividends']
         break_even = max(0.0, (st['book_cost'] - st['realized_pnl'] - st['dividends']) / quantity) if quantity else 0.0
         invested = st['net_cash_invested']
@@ -466,6 +488,43 @@ def calculate(transactions, prices, fund_rules=None):
             'break_even': break_even, 'return_rate': total / abs(invested) if abs(invested) > 1e-8 else 0.0,
             'status': '已清仓' if quantity <= 1e-8 else ('待填当前价' if current == 0 else ('盈利' if total >= 0 else '亏损'))})
     return result
+
+
+def archive_position(conn, account, code, notes=''):
+    account = str(account or '').strip() or '默认账户'
+    code = str(code or '').strip()
+    if not code:
+        raise ValueError('持仓代码不能为空')
+    transactions = all_transactions(conn)
+    position = next((item for item in calculate(transactions, all_prices(conn), fund_rule_map(conn))
+                     if item['account'] == account and item['code'] == code), None)
+    if position is None:
+        raise ValueError('没有找到需要归档的持仓')
+    if abs(number(position.get('quantity'))) > 1e-8:
+        raise ValueError('持仓数量不为 0，不能归档')
+    archived_transactions = [item for item in transactions
+                             if str(item.get('account', '')).strip() == account and str(item.get('code', '')).strip() == code]
+    transaction_ids = {item['id'] for item in archived_transactions}
+    archived_allocations = [item for item in all_sale_allocations(conn)
+                            if item.get('sale_tx_id') in transaction_ids or item.get('buy_tx_id') in transaction_ids]
+    dates = sorted(str(item.get('date', ''))[:10] for item in archived_transactions if item.get('date'))
+    archive_id = str(uuid.uuid4())
+    archived_at = datetime.now().isoformat(timespec='seconds')
+    conn.execute('''INSERT INTO position_archives
+        (id,account,code,name,asset_type,archived_at,start_date,end_date,realized_pnl,total_pnl,notes,transactions_json,allocations_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+        (archive_id, account, code, position.get('name', code), position.get('asset_type', '基金'), archived_at,
+         dates[0] if dates else '', dates[-1] if dates else '', number(position.get('realized_pnl')),
+         number(position.get('total_pnl')), str(notes or ''), json.dumps(archived_transactions, ensure_ascii=False),
+         json.dumps(archived_allocations, ensure_ascii=False)))
+    if transaction_ids:
+        placeholders = ','.join('?' for _ in transaction_ids)
+        conn.execute(f'DELETE FROM fund_sale_allocations WHERE sale_tx_id IN ({placeholders}) OR buy_tx_id IN ({placeholders})', (*transaction_ids, *transaction_ids))
+        conn.execute(f'DELETE FROM transactions WHERE id IN ({placeholders})', tuple(transaction_ids))
+    if position.get('asset_type') == '基金':
+        conn.execute('DELETE FROM fund_rules_v2 WHERE account=? AND code=?', (account, code))
+    conn.commit()
+    return next(item for item in all_archives(conn) if item['id'] == archive_id)
 
 
 def build_fund_lots(transactions, account, code):
@@ -586,8 +645,8 @@ def lookup_code(code):
     return {'code': code, 'candidates': candidates}
 
 
-def replace_state(conn, transactions, prices, settings=None, fund_rules=None, templates=None, allocations=None):
-    conn.execute('DELETE FROM transactions'); conn.execute('DELETE FROM prices'); conn.execute('DELETE FROM fund_rules'); conn.execute('DELETE FROM fund_rules_v2'); conn.execute('DELETE FROM fund_sale_allocations')
+def replace_state(conn, transactions, prices, settings=None, fund_rules=None, templates=None, allocations=None, archives=None):
+    conn.execute('DELETE FROM transactions'); conn.execute('DELETE FROM prices'); conn.execute('DELETE FROM fund_rules'); conn.execute('DELETE FROM fund_rules_v2'); conn.execute('DELETE FROM fund_sale_allocations'); conn.execute('DELETE FROM position_archives')
     for tx in transactions:
         tx = {**tx, 'id': tx.get('id') or str(uuid.uuid4())}
         conn.execute('INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (tx['id'], tx.get('date', ''), tx.get('account', ''), tx.get('asset_type', '基金'), tx.get('code', ''), tx.get('name', ''), tx.get('action', '买入'), number(tx.get('quantity')), number(tx.get('price')), number(tx.get('buy_fee')), number(tx.get('sell_fee')), number(tx.get('tax')), number(tx.get('other_fee')), tx.get('note', '')))
@@ -605,6 +664,14 @@ def replace_state(conn, transactions, prices, settings=None, fund_rules=None, te
         conn.execute('INSERT OR REPLACE INTO fund_rule_templates VALUES (?,?,?,?)', (str(item.get('id') or uuid.uuid4()), item.get('name', ''), json.dumps(item.get('redemption_tiers', []), ensure_ascii=False), item.get('updated_at', date.today().isoformat())))
     for item in (allocations or []):
         conn.execute('INSERT OR REPLACE INTO fund_sale_allocations VALUES (?,?,?,?,?,?,?,?,?,?)', tuple(item.get(k, '') for k in ('id', 'sale_tx_id', 'buy_tx_id', 'account', 'code', 'buy_date', 'quantity', 'holding_days', 'rate', 'fee')))
+    for item in (archives or []):
+        conn.execute('''INSERT OR REPLACE INTO position_archives
+            (id,account,code,name,asset_type,archived_at,start_date,end_date,realized_pnl,total_pnl,notes,transactions_json,allocations_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (str(item.get('id') or uuid.uuid4()), str(item.get('account', '')).strip() or '默认账户', str(item.get('code', '')).strip(),
+             item.get('name', ''), item.get('asset_type', '基金'), item.get('archived_at', datetime.now().isoformat(timespec='seconds')),
+             item.get('start_date', ''), item.get('end_date', ''), number(item.get('realized_pnl')), number(item.get('total_pnl')),
+             item.get('notes', ''), json.dumps(item.get('transactions', []), ensure_ascii=False), json.dumps(item.get('sale_allocations', []), ensure_ascii=False)))
     conn.commit()
 
 
@@ -654,14 +721,14 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith('/api/') and path not in ('/api/auth',):
             if not self.require_auth(): return
         if path == '/api/state':
-            conn = db(); tx, prices = all_transactions(conn), all_prices(conn); settings, rules = get_settings(conn), all_fund_rules(conn); templates, allocations = all_rule_templates(conn), all_sale_allocations(conn); conn.close()
+            conn = db(); tx, prices = all_transactions(conn), all_prices(conn); settings, rules = get_settings(conn), all_fund_rules(conn); templates, allocations, archives = all_rule_templates(conn), all_sale_allocations(conn), all_archives(conn); conn.close()
             try:
-                accounts = sorted({str(t.get('account', '')).strip() for t in tx if str(t.get('account', '')).strip()})
-                self.send_json({'transactions': tx, 'prices': prices, 'positions': calculate(tx, prices), 'settings': settings, 'fund_rules': rules, 'fund_rule_templates': templates, 'sale_allocations': allocations, 'accounts': accounts})
+                accounts = sorted({str(t.get('account', '')).strip() for t in tx if str(t.get('account', '')).strip()} | {str(item.get('account', '')).strip() for item in archives if str(item.get('account', '')).strip()})
+                self.send_json({'transactions': tx, 'prices': prices, 'positions': calculate(tx, prices), 'settings': settings, 'fund_rules': rules, 'fund_rule_templates': templates, 'sale_allocations': allocations, 'archives': archives, 'accounts': accounts})
             except ValueError as exc: self.send_json({'error': str(exc)}, 400)
             return
         if path == '/api/export':
-            conn = db(); self.send_json({'transactions': all_transactions(conn), 'prices': all_prices(conn), 'settings': get_settings(conn), 'fund_rules': all_fund_rules(conn), 'fund_rule_templates': all_rule_templates(conn), 'sale_allocations': all_sale_allocations(conn)}); conn.close(); return
+            conn = db(); self.send_json({'transactions': all_transactions(conn), 'prices': all_prices(conn), 'settings': get_settings(conn), 'fund_rules': all_fund_rules(conn), 'fund_rule_templates': all_rule_templates(conn), 'sale_allocations': all_sale_allocations(conn), 'archives': all_archives(conn)}); conn.close(); return
         if path == '/api/lookup':
             code = (parse_qs(parsed.query).get('code') or [''])[0].strip()
             if not code: self.send_json({'error': '请输入代码'}, 400); return
@@ -695,6 +762,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200); self.set_session_cookie(token); body = b'{"ok":true}'; self.send_header('Content-Type', 'application/json; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
             if path == '/api/logout':
                 token = self.cookie_token(); SESSIONS.pop(token, None); conn.close(); self.send_response(200); self.set_session_cookie('', 0); body = b'{"ok":true}'; self.send_header('Content-Type', 'application/json; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
+            if path == '/api/archives':
+                archive = archive_position(conn, payload.get('account'), payload.get('code'), payload.get('notes', ''))
+                conn.close(); self.send_json({'ok': True, 'archive': archive}); return
+            if path.startswith('/api/archives/'):
+                archive_id = path.rsplit('/', 1)[-1]
+                if not conn.execute('SELECT 1 FROM position_archives WHERE id=?', (archive_id,)).fetchone():
+                    raise ValueError('没有找到归档记录')
+                conn.execute('UPDATE position_archives SET notes=? WHERE id=?', (str(payload.get('notes', '')), archive_id))
+                conn.commit(); conn.close(); self.send_json({'ok': True}); return
             if path == '/api/transactions':
                 candidate = {**payload, 'id': payload.get('id') or str(uuid.uuid4()), 'asset_type': payload.get('asset_type', '基金'), 'action': payload.get('action', '买入'), 'code': str(payload.get('code', '')).strip()}
                 candidate['account'] = str(candidate.get('account', '')).strip() or '默认账户'
@@ -709,9 +785,27 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute('DELETE FROM fund_sale_allocations WHERE sale_tx_id=?', (candidate['id'],))
                 for item in allocation_preview:
                     conn.execute('INSERT INTO fund_sale_allocations VALUES (?,?,?,?,?,?,?,?,?,?)', (str(uuid.uuid4()), candidate['id'], item.get('buy_tx_id', ''), candidate['account'], candidate['code'], item.get('date', ''), number(item.get('quantity')), int(item.get('holding_days', 0)), number(item.get('rate')), number(item.get('fee'))))
-                conn.commit(); conn.close(); self.send_json({'ok': True, 'id': candidate['id']}); return
+                after = next((item for item in calculate(all_transactions(conn), all_prices(conn), fund_rule_map(conn)) if item['account'] == candidate['account'] and item['code'] == candidate['code']), None)
+                sold_out = candidate['action'] == '卖出' and after is not None and abs(number(after.get('quantity'))) <= 1e-8
+                conn.commit(); conn.close(); self.send_json({'ok': True, 'id': candidate['id'], 'sold_out': sold_out}); return
             if path == '/api/prices':
                 conn.execute('INSERT OR REPLACE INTO prices VALUES (?,?,?,?,?,?)', (str(payload.get('code', '')).strip(), payload.get('name', ''), payload.get('asset_type', '基金'), number(payload.get('price')), date.today().isoformat(), payload.get('pnl_override'))); conn.commit(); conn.close(); self.send_json({'ok': True}); return
+            if path == '/api/position-snapshot':
+                account = str(payload.get('account', '')).strip() or '默认账户'
+                code = str(payload.get('code', '')).strip()
+                quantity_value = number(payload.get('quantity'))
+                unit_cost = number(payload.get('unit_cost'))
+                market_value = number(payload.get('market_value'))
+                existing_price = conn.execute('SELECT price FROM prices WHERE code=?', (code,)).fetchone()
+                current_price = number(payload.get('current_price')) or number(existing_price['price'] if existing_price else 0) or (market_value / quantity_value if quantity_value else 0)
+                if not code or quantity_value <= 0: raise ValueError('持仓代码和数量不能为空')
+                if unit_cost < 0 or market_value < 0 or current_price < 0: raise ValueError('成本价、市值和现价不能为负数')
+                row = conn.execute("SELECT * FROM transactions WHERE account=? AND code=? AND action='买入' AND note LIKE '手工录入当前持仓%' ORDER BY date, id LIMIT 1", (account, code)).fetchone()
+                if row is None: raise ValueError('该持仓包含历史交易，不能直接改写；请通过加减仓调整')
+                conn.execute('UPDATE transactions SET name=?, quantity=?, price=? WHERE id=?', (str(payload.get('name', '')).strip() or row['name'], quantity_value, unit_cost, row['id']))
+                conn.execute('INSERT OR REPLACE INTO prices VALUES (?,?,?,?,?,?)', (code, str(payload.get('name', '')).strip() or row['name'], payload.get('asset_type', row['asset_type']), current_price, date.today().isoformat(), None))
+                calculate(all_transactions(conn), all_prices(conn), fund_rule_map(conn))
+                conn.commit(); conn.close(); self.send_json({'ok': True}); return
             if path == '/api/settings':
                 for key, value in payload.items():
                     if key in DEFAULT_SETTINGS:
@@ -824,17 +918,46 @@ class Handler(BaseHTTPRequestHandler):
                 conversion_ids = {match.group(1) for item in inserted for match in [re.search(r'跨TA转换 (\d{8}-\d{8})', item.get('note', ''))] if match}
                 conn.commit(); conn.close(); self.send_json({'ok': True, 'inserted': len(inserted), 'skipped': skipped, 'opening_count': opening_count, 'conversion_count': len(conversion_ids)}); return
             if path == '/api/import':
-                replace_state(conn, payload.get('transactions', []), payload.get('prices', []), payload.get('settings'), payload.get('fund_rules'), payload.get('fund_rule_templates'), payload.get('sale_allocations')); conn.close(); self.send_json({'ok': True}); return
+                replace_state(conn, payload.get('transactions', []), payload.get('prices', []), payload.get('settings'), payload.get('fund_rules'), payload.get('fund_rule_templates'), payload.get('sale_allocations'), payload.get('archives')); conn.close(); self.send_json({'ok': True}); return
             conn.close(); self.send_json({'error': '未找到接口'}, 404)
         except (ValueError, KeyError, json.JSONDecodeError) as exc: self.send_json({'error': str(exc)}, 400)
 
     def do_DELETE(self):
         if not self.require_auth(): return
         path = urlparse(self.path).path
-        if path.startswith('/api/transactions/'):
-            tx_id = path.rsplit('/', 1)[-1]
-            conn = db(); conn.execute('DELETE FROM transactions WHERE id=?', (tx_id,)); conn.execute('DELETE FROM fund_sale_allocations WHERE sale_tx_id=? OR buy_tx_id=?', (tx_id, tx_id)); conn.commit(); conn.close(); self.send_json({'ok': True}); return
-        self.send_json({'error': '未找到接口'}, 404)
+        try:
+            if path == '/api/positions':
+                payload, conn = self.read_json(), db()
+                items = payload.get('items')
+                if not isinstance(items, list) or not items: raise ValueError('请选择要删除的持仓')
+                targets = {(str(item.get('account', '')).strip() or '默认账户', str(item.get('code', '')).strip()) for item in items if isinstance(item, dict) and str(item.get('code', '')).strip()}
+                deleted = 0
+                for account, code in targets:
+                    if not conn.execute('SELECT 1 FROM transactions WHERE account=? AND code=? LIMIT 1', (account, code)).fetchone(): continue
+                    conn.execute('''DELETE FROM fund_sale_allocations
+                        WHERE sale_tx_id IN (SELECT id FROM transactions WHERE account=? AND code=?)
+                           OR buy_tx_id IN (SELECT id FROM transactions WHERE account=? AND code=?)''', (account, code, account, code))
+                    conn.execute('DELETE FROM transactions WHERE account=? AND code=?', (account, code))
+                    conn.execute('DELETE FROM fund_rules_v2 WHERE account=? AND code=?', (account, code))
+                    if not conn.execute('SELECT 1 FROM transactions WHERE code=? LIMIT 1', (code,)).fetchone():
+                        conn.execute('DELETE FROM prices WHERE code=?', (code,))
+                    deleted += 1
+                conn.commit(); conn.close(); self.send_json({'ok': True, 'deleted': deleted}); return
+            if path == '/api/archives':
+                payload, conn = self.read_json(), db()
+                raw_ids = payload.get('ids')
+                if not isinstance(raw_ids, list): raise ValueError('请选择要删除的归档')
+                ids = list(dict.fromkeys(str(item).strip() for item in raw_ids if str(item).strip()))
+                if not ids: raise ValueError('请选择要删除的归档')
+                placeholders = ','.join('?' for _ in ids)
+                deleted = conn.execute(f'DELETE FROM position_archives WHERE id IN ({placeholders})', ids).rowcount
+                conn.commit(); conn.close(); self.send_json({'ok': True, 'deleted': deleted}); return
+            if path.startswith('/api/transactions/'):
+                tx_id = path.rsplit('/', 1)[-1]
+                conn = db(); conn.execute('DELETE FROM transactions WHERE id=?', (tx_id,)); conn.execute('DELETE FROM fund_sale_allocations WHERE sale_tx_id=? OR buy_tx_id=?', (tx_id, tx_id)); conn.commit(); conn.close(); self.send_json({'ok': True}); return
+            self.send_json({'error': '未找到接口'}, 404)
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            self.send_json({'error': str(exc)}, 400)
 
 
 def main():
